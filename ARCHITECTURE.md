@@ -1,145 +1,257 @@
-# IEKF + Factor Graph Architecture for RGB-D Visual-Inertial SLAM
+# IEKF + Factor Graph Architecture for Underwater SLAM
 
 ## Recommended Architecture
 
-Use the **IEKF as the low-latency real-time state propagator** and the **factor graph as the authoritative estimator/back-end**.
+For an underwater robot with **IMU, DVL, pressure/depth sensor, depth camera, and 360 2D sonar**, use the **IEKF as the low-latency local navigation estimator** and the **factor graph as the authoritative SLAM back-end**.
+
+The best default architecture is:
 
 ```text
-High-rate IMU ---------------------> IEKF prediction -----------------> current low-latency pose
+IMU -----------------------------> IEKF propagation -----------------> current low-latency state
+DVL velocity --------------------> IEKF local correction ------------+
+pressure/depth ------------------> IEKF depth correction ------------+
                                       ^
                                       |
 Factor graph optimized state --------+
 
-IMU preintegration -----------------> factor graph
-RGB-D / depth constraints ----------> factor graph
-Loop closures ----------------------> factor graph
-Priors / GPS / wheel odom ----------> factor graph
+IMU preintegration --------------> factor graph
+DVL velocity / delta factors ----> factor graph
+pressure/depth factors ----------> factor graph
+depth-camera constraints --------> factor graph
+360 sonar constraints -----------> factor graph
+loop closures -------------------> factor graph
+surface GPS / acoustic fixes ----> factor graph, if available
 ```
 
-The cleanest design is:
+Use the IEKF for **current-time navigation** and the factor graph for **history, mapping, and global consistency**.
+
+## Main Recommendation
+
+For this underwater setup, the cleanest split is:
 
 ```text
-1. IEKF propagates the latest graph state forward using IMU.
-2. Factor graph processes IMU + RGB-D/depth + loop closures.
-3. Graph periodically resets/corrects the IEKF state.
-4. IEKF output is used for real-time control, tracking, rendering, and prediction.
-5. Factor graph output is used as the globally consistent trajectory and map estimate.
+IEKF gets:          IMU + DVL + pressure/depth + graph resets
+Factor graph gets:  IMU + DVL + pressure/depth + camera/depth + sonar + loop closures
 ```
 
-## Why Include an IEKF?
+The IEKF should usually **not** consume the depth camera or 360 sonar as normal parallel updates. Let the visual/sonar front-end turn those sensors into graph constraints. The IEKF state can be used as the initial guess for camera/sonar alignment.
 
-The IEKF is valuable because it is fast, causal, and low-latency.
+This avoids double counting while still giving the robot a low-latency navigation estimate.
 
-It provides:
+## Why This Is Different From Aerial/Ground VIO
 
-- High-rate pose, velocity, and bias propagation from IMU data.
-- A smooth current-time estimate between camera frames or graph updates.
-- A good initial guess for RGB-D tracking, ICP, feature alignment, or scan matching.
-- Robust short-term motion prediction during blur, dropped frames, or low-texture scenes.
-- A simple state interface for control loops, visualization, AR rendering, or downstream autonomy.
+Underwater robots usually do not have continuous GPS. They also often have degraded optical sensing due to turbidity, lighting, suspended particles, and low texture. The reliable local navigation stack is usually:
 
-The IEKF is not usually the best place to solve global consistency. It does not naturally handle long histories, loop closures, map-wide corrections, or relinearization over old states.
+```text
+IMU + DVL + pressure/depth
+```
 
-## Why Include a Factor Graph?
+Those sensors are good enough to keep a local navigation estimate bounded for short-to-medium periods. The camera and sonar are then used mainly for map-relative correction, place recognition, loop closure, terrain/object constraints, and drift reduction.
 
-The factor graph is valuable because it optimizes a history of states and constraints.
+## What Each Sensor Provides
 
-It provides:
+| Sensor | Best Use In IEKF | Best Use In Factor Graph |
+| --- | --- | --- |
+| IMU | High-rate attitude, velocity, and position propagation | Preintegrated IMU factors between keyframes |
+| DVL | Body-frame or beam-frame velocity correction | Velocity factors, water-track/bottom-track factors, delta-pose constraints |
+| Pressure/depth | Direct vertical position correction | Depth prior/factor on z or altitude/depth state |
+| Depth camera | Usually initial-guess consumer only | RGB-D odometry, ICP, point-cloud/landmark/plane factors |
+| 360 2D sonar | Usually initial-guess consumer only | Scan matching, sonar odometry, loop closures, wall/pipe/structure factors |
+| Acoustic positioning | Optional correction if low-rate | Absolute/relative position factors, range factors |
+| Surface GPS | Optional reset when surfaced | Absolute pose/position prior factors |
 
-- Joint optimization over poses, velocities, biases, landmarks, and calibration parameters.
-- IMU preintegration factors between keyframes.
-- RGB-D odometry, ICP, feature reprojection, depth, plane, and landmark factors.
-- Loop closure constraints that correct accumulated drift.
-- Proper relinearization and smoothing over a sliding window or full trajectory.
-- A consistent optimized trajectory for mapping.
+## IEKF Role
 
-The factor graph is usually heavier than an IEKF. It may run at keyframe rate or asynchronously, and its result may arrive with latency.
+The IEKF estimates the current navigation state:
 
-## What They Provide Differently
+```text
+x = {
+  R_wb,      body orientation in world
+  p_wb,      body position in world
+  v_wb,      body velocity in world
+  b_g,       gyro bias
+  b_a        accelerometer bias
+}
+```
 
-| Component | Main Strength | Main Weakness | Typical Rate |
-| --- | --- | --- | --- |
-| IEKF | Low-latency current state | Local consistency only | IMU rate, e.g. 200-1000 Hz |
-| Factor graph | Globally consistent optimized state | More compute and latency | Camera/keyframe rate, e.g. 5-30 Hz |
+For an underwater robot, the IEKF should normally use:
+
+```text
+IMU prediction
+DVL velocity update
+pressure/depth update
+graph optimized-state reset
+```
+
+The DVL is especially important because it directly constrains velocity. Without DVL, the IMU position estimate drifts quickly. With DVL and pressure depth, the IEKF can provide a useful real-time navigation solution even when camera/sonar processing is delayed.
 
 The IEKF answers:
 
 ```text
-Where am I right now, using the latest IMU data?
+Where is the vehicle right now for control, stabilization, tracking, and planning?
+```
+
+## Factor Graph Role
+
+The factor graph owns the best estimate of the trajectory and map.
+
+Typical variables:
+
+```text
+X_i = vehicle pose at keyframe i
+V_i = vehicle velocity at keyframe i
+B_i = IMU bias at keyframe i
+L_j = landmarks or map features, optional
+C   = calibration parameters, optional
+```
+
+Typical factors:
+
+```text
+PriorFactor<Pose3>                 initial pose or surface GPS prior
+PriorFactor<Vector3>               initial velocity prior
+PriorFactor<imuBias>               initial IMU bias prior
+ImuFactor / CombinedImuFactor      preintegrated IMU between keyframes
+DVL velocity factor                measured body/water/bottom-relative velocity
+Depth/pressure factor              z/depth measurement
+BetweenFactor<Pose3>               camera or sonar odometry
+ICP / scan-matching factor         depth-camera or sonar alignment
+RangeFactor                        acoustic ranging, if available
+Loop closure factor                revisiting known structure or terrain
 ```
 
 The factor graph answers:
 
 ```text
-What trajectory and map best explain all recent and historical measurements?
+What trajectory and map best explain all IMU, DVL, pressure, camera, sonar, and loop-closure data?
 ```
 
-## Why Combine Them?
+## DVL Handling
 
-Combining them gives both low latency and consistency.
+DVL measurements are commonly body-frame velocity measurements.
 
-The IEKF handles real-time propagation:
+If bottom lock is valid:
 
 ```text
-latest optimized graph state + new IMU samples -> current pose now
+z_dvl ~= R_bw * v_wb + noise
 ```
 
-The factor graph handles correction and consistency:
+where `R_bw` rotates world velocity into the body frame.
+
+If the DVL measures water-relative velocity instead of bottom-relative velocity, account for current:
 
 ```text
-IMU + RGB-D + loop closures + priors -> optimized trajectory/map
+z_dvl ~= R_bw * (v_wb - v_current_world) + noise
 ```
 
-Together, the system can:
+For water-track operation, the water current may need to be estimated as an additional state or modeled as increased noise. Bottom-track DVL is much easier for localization.
 
-- Control or render using a current-time pose instead of waiting for optimization.
-- Track depth/RGB frames with a good motion prior from IMU propagation.
-- Correct long-term drift using graph optimization and loop closures.
-- Keep IMU biases consistent through graph-estimated bias updates.
-- Maintain a map that does not accumulate the same drift as pure dead reckoning.
+Recommended usage:
 
-## Depth Camera Usage
+```text
+IEKF:         DVL velocity update at DVL rate
+Factor graph: DVL velocity factors at keyframes or integrated intervals
+```
 
-In the recommended architecture, depth is usually processed by the factor graph/front-end, not directly fused into the IEKF as raw pixels.
+This is not harmful double counting as long as the IEKF output is not added back to the graph as an independent factor. The graph still uses the raw DVL measurements.
 
-Depth can produce graph constraints such as:
+## Pressure / Depth Handling
 
-- RGB-D visual odometry between keyframes.
-- ICP or point-cloud alignment constraints.
-- 3D landmark observations.
-- Plane or surface constraints.
-- Dense/semi-dense map alignment constraints.
+The pressure sensor gives a strong vertical constraint:
 
-The IEKF may still use the output of local RGB-D tracking as a correction if the graph is too slow or asynchronous. However, if the graph already uses those same depth measurements, avoid treating the IEKF-corrected pose as an independent graph factor.
+```text
+z_depth ~= depth(p_wb) + noise
+```
+
+Use it in both places:
+
+```text
+IEKF:         direct depth correction for real-time vertical stability
+Factor graph: depth factor on pose z/depth at timestamps or keyframes
+```
+
+As with DVL, this is safe if the IEKF state is only used as a live estimate or graph initial guess, not as an independent graph measurement.
+
+## Depth Camera Handling
+
+The depth camera is usually processed by a front-end that produces graph constraints.
+
+Possible constraints:
+
+```text
+RGB-D visual odometry between keyframes
+ICP alignment against a local point cloud
+3D landmark observations
+Plane or seafloor patch constraints
+Object/structure constraints, e.g. pipe, hull, wall, dock, cable
+```
+
+Recommended usage:
+
+```text
+IEKF pose -> initial guess for RGB-D tracking or ICP
+Depth camera -> graph factors
+Graph optimized state -> IEKF reset/correction
+```
+
+Avoid making depth-camera odometry a normal IEKF correction if the same odometry is already being added to the graph. Use it as an IEKF fallback only when the graph is delayed and the controller needs a local correction immediately.
+
+## 360 2D Sonar Handling
+
+A 360 2D sonar is often more reliable than a camera in turbid water, but it has its own geometry and ambiguity problems.
+
+It can provide:
+
+```text
+2D scan matching against previous sonar scan
+scan-to-submap alignment
+loop closure against old sonar submaps
+wall, pipe, tunnel, pier, or hull constraints
+range-bearing features in the horizontal sonar plane
+```
+
+Recommended usage:
+
+```text
+IEKF pose -> initial guess for sonar scan matching
+360 sonar -> graph factors and loop closures
+Graph optimized state -> IEKF reset/correction
+```
+
+Do not use sonar scan-matching output as both a strong IEKF update and a strong graph factor by default. If you need sonar to correct the IEKF immediately, treat that correction as temporary and do not feed the resulting IEKF pose back into the graph as a measurement.
 
 ## Avoid Double Counting
 
 The most important rule is:
 
 ```text
-Do not feed an IEKF estimate into the factor graph as an independent measurement
-if that IEKF estimate was produced from measurements already used by the graph.
+Raw measurements can feed both the IEKF and graph only if the IEKF output is not treated as another independent graph measurement.
 ```
 
-Bad pattern:
+Safe pattern:
 
 ```text
-Raw IMU ------------------> graph IMU factors
-Raw depth/RGB-D ----------> graph depth/visual factors
-Same IMU + depth ---------> IEKF
-IEKF pose ----------------> graph pose factor  # double counts information
+Raw IMU -----------------------> IEKF prediction
+Raw DVL -----------------------> IEKF velocity update
+Raw pressure ------------------> IEKF depth update
+
+Raw IMU -----------------------> graph IMU factors
+Raw DVL -----------------------> graph DVL factors
+Raw pressure ------------------> graph depth factors
+Raw camera/depth --------------> graph visual/depth factors
+Raw 360 sonar -----------------> graph sonar factors
+
+IEKF state --------------------> graph initial guess only
+Graph optimized state ---------> IEKF reset/correction
 ```
 
-Good pattern:
+Risky pattern:
 
 ```text
-Raw IMU ------------------> graph IMU factors
-Raw depth/RGB-D ----------> graph depth/visual factors
-IEKF pose ----------------> graph initial guess only
-Graph optimized state ----> IEKF reset/correction
+Raw IMU/DVL/pressure/camera/sonar -> IEKF
+Raw IMU/DVL/pressure/camera/sonar -> graph factors
+IEKF pose ------------------------> graph pose factor  # double counting
 ```
-
-The IEKF state is allowed to initialize or warm-start graph optimization. It should not be added as a strong independent measurement unless its covariance and correlations with existing graph factors are modeled correctly.
 
 ## Practical Runtime Loop
 
@@ -147,58 +259,83 @@ At each IMU sample:
 
 ```text
 IEKF.predict(accel, gyro, dt)
-graph_preintegrator.integrateMeasurement(accel, gyro, dt)
+graph_imu_preintegrator.integrateMeasurement(accel, gyro, dt)
 ```
 
-At each RGB-D frame:
+At each DVL sample:
 
 ```text
-1. Use IEKF pose as the initial guess for tracking/alignment.
-2. Estimate frame-to-frame or frame-to-map motion from RGB-D/depth.
-3. If this is a keyframe, add graph factors:
-   - IMU preintegration factor
-   - RGB-D odometry or ICP factor
-   - optional landmark/depth/plane factors
-4. Run iSAM2 or fixed-lag smoothing.
-5. If the graph has a new optimized current state, reset/correct the IEKF.
+1. Validate bottom lock, beam quality, altitude, and outliers.
+2. IEKF.update_dvl_velocity(z_dvl)
+3. Store raw DVL measurement for graph factor creation.
 ```
 
-At loop closure:
+At each pressure/depth sample:
 
 ```text
-1. Detect a previous place/keyframe.
-2. Estimate relative pose between current and old keyframe.
-3. Add a loop-closure factor.
-4. Optimize the graph.
-5. Push the corrected current pose, velocity, and bias into the IEKF.
+1. Convert pressure to depth using water density and calibration.
+2. IEKF.update_depth(z_depth)
+3. Store depth measurement for graph factor creation.
 ```
 
-## When to Use Graph-Only
-
-A graph-only estimator can be enough if:
-
-- Fixed-lag smoothing runs fast enough for your control/rendering latency budget.
-- You do not need a high-rate pose between graph updates.
-- Your platform tolerates delayed state estimates.
-
-In that case, the IEKF may be unnecessary. The graph can own the whole state estimate.
-
-## When to Use IEKF + Graph
-
-Use both when:
-
-- You need high-rate current-time pose estimates.
-- Your graph runs at keyframe rate or asynchronously.
-- You need robust prediction through camera dropouts or motion blur.
-- You need loop closure and map consistency.
-- You want a clean separation between real-time tracking and global optimization.
-
-## Short Summary
-
-Use the **IEKF for now** and the **factor graph for consistency**.
+At each depth-camera frame:
 
 ```text
-IEKF:         fast, local, current-time, IMU-driven
-Factor graph: optimized, historical, globally consistent, map-driven
-Combined:    low-latency pose plus corrected trajectory and map
+1. Use IEKF pose as initial guess.
+2. Run RGB-D odometry, ICP, or local map alignment.
+3. If keyframe, add visual/depth factors to graph.
+4. Do not add the IEKF pose itself as a graph measurement.
+```
+
+At each 360 sonar scan:
+
+```text
+1. Use IEKF pose as initial guess for scan matching.
+2. Match scan to previous scan, local submap, or historical submap.
+3. Add sonar odometry, scan-to-map, or loop-closure factor to graph.
+4. Reject ambiguous matches with robust gating.
+```
+
+At graph update:
+
+```text
+1. Run iSAM2 or fixed-lag smoothing.
+2. Extract optimized pose, velocity, and IMU bias near the current time.
+3. Reset/correct the IEKF state.
+4. Continue IEKF propagation with new IMU samples.
+```
+
+## When To Feed Camera/Sonar Into The IEKF
+
+Default:
+
+```text
+Camera/depth and sonar go to the graph, not directly to IEKF.
+```
+
+Use camera/sonar as an IEKF update only when:
+
+```text
+graph latency is too high for control
+DVL is unavailable or has lost bottom lock
+the vehicle needs a temporary local correction
+the graph back-end is dropped or overloaded
+```
+
+If you do this, keep the accounting clean:
+
+```text
+camera/sonar correction -> IEKF live state
+same camera/sonar measurement -> graph factor
+IEKF live state -> graph initial guess only
+```
+
+## Best Architecture In One Sentence
+
+For an underwater robot, the best default is:
+
+```text
+IEKF = IMU + DVL + pressure for low-latency navigation
+Factor graph = IMU + DVL + pressure + depth camera + 360 sonar + loop closures for SLAM consistency
+Graph result = periodic reset/correction for the IEKF
 ```
