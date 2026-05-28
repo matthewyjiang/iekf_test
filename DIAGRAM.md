@@ -1,6 +1,7 @@
 # Diagram
 
-```┌─────────────────────────────────────────────────────────────────────────┐
+```
+┌─────────────────────────────────────────────────────────────────────────┐
 │                          Raw Sensors                                     │
 │                                                                          │
 │   IMU (400Hz)          DVL (10Hz)         Depth Camera (30Hz)            │
@@ -42,4 +43,5 @@
                     Optimized trajectory + map
                                │
                                └──────────────────► pose correction
-                                                    feedback to IEKF```
+                                                    feedback to IEKF
+```
