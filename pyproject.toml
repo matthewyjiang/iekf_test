@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 iekf-demo = "iekf_imu.main:main"
+iekf-graph-demo = "iekf_imu.graph_main:main"
 
 [build-system]
 requires = ["hatchling"]

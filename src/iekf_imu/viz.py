@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -100,5 +101,91 @@ def animate_world(
             ani.save(out, writer=PillowWriter(fps=30))
         else:
             ani.save(out, writer="ffmpeg", fps=30, dpi=130)
+    else:
+        plt.show()
+
+
+def plot_graph_compare(
+    times: np.ndarray,
+    gt_p: np.ndarray,
+    iekf_p: np.ndarray,
+    kf_indices: np.ndarray,
+    graph_p: np.ndarray,
+    save: Optional[str] = None,
+) -> None:
+    """3D trajectory + per-axis error plots comparing IEKF vs graph vs GT.
+
+    Args:
+        times:      (N,)   full IMU-step time array.
+        gt_p:       (N,3)  ground-truth positions.
+        iekf_p:     (N,3)  IEKF estimated positions (dense, IMU rate).
+        kf_indices: (K,)   IMU-step indices of the K keyframes.
+        graph_p:    (K,3)  graph-optimised positions at keyframes.
+        save:       if given, save figure instead of showing.
+    """
+    kf_times = times[kf_indices]
+    gt_kf = gt_p[kf_indices]
+    iekf_kf = iekf_p[kf_indices]
+
+    graph_err = graph_p - gt_kf       # (K,3)
+    iekf_err_kf = iekf_kf - gt_kf    # (K,3)
+
+    fig = plt.figure(figsize=(14, 10))
+
+    # ---- 3D trajectory ----
+    ax3d = fig.add_subplot(2, 2, (1, 2), projection="3d")
+    all_pts = np.vstack([gt_p, iekf_p, graph_p])
+    _set_equal_3d(ax3d, all_pts)
+    ax3d.plot(gt_p[:, 0], gt_p[:, 1], gt_p[:, 2],
+              color="0.65", lw=2, label="ground truth")
+    ax3d.plot(iekf_p[:, 0], iekf_p[:, 1], iekf_p[:, 2],
+              color="tab:blue", lw=1.5, alpha=0.7, label="IEKF (dense)")
+    ax3d.scatter(graph_p[:, 0], graph_p[:, 1], graph_p[:, 2],
+                 c="tab:green", s=18, zorder=5, label="graph keyframes")
+    ax3d.set_xlabel("x [m]")
+    ax3d.set_ylabel("y [m]")
+    ax3d.set_zlabel("z [m]")
+    ax3d.set_title("IEKF + factor graph: trajectory comparison")
+    ax3d.legend(loc="upper right")
+
+    # ---- Position error vs time ----
+    ax_pos = fig.add_subplot(2, 2, 3)
+    ax_pos.plot(kf_times, iekf_err_kf[:, 0], color="tab:blue",
+                alpha=0.6, lw=1, label="IEKF x")
+    ax_pos.plot(kf_times, iekf_err_kf[:, 1], color="tab:cyan",
+                alpha=0.6, lw=1, label="IEKF y")
+    ax_pos.plot(kf_times, iekf_err_kf[:, 2], color="tab:purple",
+                alpha=0.6, lw=1, label="IEKF z")
+    ax_pos.plot(kf_times, graph_err[:, 0], color="tab:green",
+                lw=1.5, label="graph x")
+    ax_pos.plot(kf_times, graph_err[:, 1], color="tab:olive",
+                lw=1.5, label="graph y")
+    ax_pos.plot(kf_times, graph_err[:, 2], color="tab:brown",
+                lw=1.5, label="graph z")
+    ax_pos.axhline(0, color="k", lw=0.5)
+    ax_pos.set_ylabel("position error [m]")
+    ax_pos.set_xlabel("time [s]")
+    ax_pos.grid(True)
+    ax_pos.legend(fontsize=7, ncol=2)
+    ax_pos.set_title("Position error (at keyframes)")
+
+    # ---- Position error norm ----
+    ax_norm = fig.add_subplot(2, 2, 4)
+    ax_norm.plot(kf_times, np.linalg.norm(iekf_err_kf, axis=1),
+                 color="tab:blue", lw=1.5, label="IEKF ‖err‖")
+    ax_norm.plot(kf_times, np.linalg.norm(graph_err, axis=1),
+                 color="tab:green", lw=1.5, label="graph ‖err‖")
+    ax_norm.axhline(0, color="k", lw=0.5)
+    ax_norm.set_ylabel("‖position error‖ [m]")
+    ax_norm.set_xlabel("time [s]")
+    ax_norm.grid(True)
+    ax_norm.legend()
+    ax_norm.set_title("Position error norm (at keyframes)")
+
+    fig.tight_layout()
+
+    if save:
+        out = Path(save)
+        fig.savefig(out, dpi=130, bbox_inches="tight")
     else:
         plt.show()
